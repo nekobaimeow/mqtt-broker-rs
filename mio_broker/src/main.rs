@@ -155,9 +155,9 @@ fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Ve
     if body.len() < 6 + plen + 2 {
         return None;
     }
-    let flags = body[9 + plen]; // Flags byte at position 9 + protocol name length
-    let keepalive = u16::from_be_bytes([body[10 + plen], body[11 + plen]]);
-    let mut pos = 12 + plen;
+    let flags = body[3 + plen]; // connect flags byte: 2(len) + plen(protocol name) + 1(level)
+    let keepalive = u16::from_be_bytes([body[4 + plen], body[5 + plen]]);
+    let mut pos = 6 + plen; // payload starts after name+level+flags+keepalive
     
     // Parse client id
     let clen = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
@@ -307,6 +307,8 @@ struct Client {
     will_retain: bool,
     will_topic: String,
     will_message: Vec<u8>,
+    // true when the client sent a clean DISCONNECT packet (suppresses LWT)
+    clean_disconnect: bool,
 }
 
 impl Client {
@@ -430,6 +432,21 @@ impl Broker {
         if let Some((topic, msg, qos, retain)) = will {
             self.publish(&topic, &msg, qos, retain);
         }
+    }
+
+    // Remove a client, publishing its LWT unless it disconnected cleanly
+    // (sent DISCONNECT). Every disconnect path must go through this.
+    fn remove_client(&mut self, token: usize) {
+        let clean = self
+            .clients
+            .get(&token)
+            .map(|c| c.clean_disconnect)
+            .unwrap_or(false);
+        if !clean {
+            self.publish_lwt(token);
+        }
+        self.subs.retain(|s| s.token != token);
+        self.clients.remove(&token);
     }
 
     // deliver one message to a single client at the given forward QoS.
@@ -699,6 +716,8 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             }
             DISCONNECT => {
                 println!("[-] DISCONNECT {} (token {token})", client_id);
+                let c = broker.clients.get_mut(&token).unwrap();
+                c.clean_disconnect = true;
                 return Err("disconnect".into());
             }
             _ => return Err(format!("unknown packet type {ptype}")),
@@ -751,9 +770,7 @@ fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
         (done, dead)
     };
     if socket_dead {
-        broker.subs.retain(|s| s.token != token);
-        broker.publish_lwt(token);
-        broker.clients.remove(&token);
+        broker.remove_client(token);
         return;
     }
     if let Some(c) = broker.clients.get_mut(&token) {
@@ -850,6 +867,7 @@ fn main() {
                                     will_retain: false,
                                     will_topic: String::new(),
                                     will_message: Vec::new(),
+                                    clean_disconnect: false,
                                 };
                                 broker.clients.insert(token, client);
                                 let c = broker.clients.get_mut(&token).unwrap();
@@ -868,8 +886,7 @@ fn main() {
                 Token(token) => {
                     if event.is_readable() {
                         if drain_client(&mut broker, token).is_err() {
-                            broker.subs.retain(|s| s.token != token);
-                            broker.clients.remove(&token);
+                            broker.remove_client(token);
                             continue;
                         }
                     }
@@ -915,8 +932,7 @@ fn main() {
                 continue;
             }
             if drain_client(&mut broker, t).is_err() {
-                broker.subs.retain(|s| s.token != t);
-                broker.clients.remove(&t);
+                broker.remove_client(t);
             }
         }
         // drain queued new forwards from this round of reads
@@ -943,8 +959,7 @@ fn main() {
             .map(|(t, _)| *t)
             .collect();
         for t in dead {
-            broker.subs.retain(|s| s.token != t);
-            broker.clients.remove(&t);
+            broker.remove_client(t);
         }
         // retransmission sweep: any in-flight message older than
         // QOS1_RETRY_AFTER gets re-queued with DUP=1 (QoS1: PUBLISH;
@@ -986,16 +1001,14 @@ fn main() {
                 Err(()) => {
                     // queue full of reliable traffic: cannot retry, drop client
                     println!("[!] DROP     {} (QoS1/2 queue full during retry)", c.client_id);
-                    broker.subs.retain(|s| s.token != t);
-                    broker.clients.remove(&t);
+                    broker.remove_client(t);
                 }
             }
         }
         for (t, pid) in give_up {
             if let Some(c) = broker.clients.get_mut(&t) {
                 println!("[!] GIVEUP   {} pid {pid} after {QOS1_MAX_RETRIES} retries", c.client_id);
-                broker.subs.retain(|s| s.token != t);
-                broker.clients.remove(&t);
+                broker.remove_client(t);
             }
         }
         let loop_ms = loop_start.elapsed().as_micros();
