@@ -12,6 +12,7 @@ const READ_CAP: usize = 65536; // per-connection read buffer cap
 const MAX_PACKET: usize = 1 << 20; // refuse packets > 1MB (anti-memory-attack)
 const WRITE_QUEUE_CAP: usize = 8192; // bounded outbound queue (QoS0 drop when full)
 const IN_FLIGHT_CAP: usize = 256; // max unacked QoS1 per connection (memory guard)
+const OFFLINE_CAP: usize = 1024;  // max queued messages per persistent offline session
 const QOS1_MAX_RETRIES: u32 = 3; // give up on the client after N unanswered retries
 
 fn qos1_retry_after() -> Duration {
@@ -147,7 +148,7 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 }
 
 // ---- packet parsers (same logic as the threaded broker) ----
-fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Vec<u8>)> {
+fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Vec<u8>, bool)> {
     if body.len() < 12 {
         return None; // Need at least protocol name/flags/keepalive + client id (min 4+1+2+1+2 = 10)
     }
@@ -167,6 +168,9 @@ fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Ve
     }
     let cid = String::from_utf8_lossy(&body[pos..pos + clen]).to_string();
     pos += clen;
+    
+    // clean session flag: bit 1 of connect flags (0x02)
+    let clean_session = (flags >> 1) & 0x01 == 1;
     
     // Parse will flag, QoS, retain, topic, message
     let will_flag = (flags >> 2) & 0x01 == 1;
@@ -197,9 +201,9 @@ fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Ve
         }
         let wmsg = body[pos..pos + mlen].to_vec();
         
-        Some((cid, keepalive, will_flag, will_qos as u8, will_retain, wtopic, wmsg))
+        Some((cid, keepalive, will_flag, will_qos as u8, will_retain, wtopic, wmsg, clean_session))
     } else {
-        Some((cid, keepalive, false, 0, false, String::new(), Vec::new()))
+        Some((cid, keepalive, false, 0, false, String::new(), Vec::new(), clean_session))
     }
 }
 
@@ -309,6 +313,8 @@ struct Client {
     will_message: Vec<u8>,
     // true when the client sent a clean DISCONNECT packet (suppresses LWT)
     clean_disconnect: bool,
+    // true when the client connected with clean session = 1 (no persistence)
+    clean_session: bool,
 }
 
 impl Client {
@@ -362,11 +368,19 @@ struct Broker {
     drops: u64,
     dead_pruned: u64,
     retained: HashMap<String, (Vec<u8>, u8)>, // topic -> (payload, qos)
+    // persistent sessions (clean session = 0), keyed by client_id
+    sessions: HashMap<String, SessionState>,
+}
+
+// persistent session state: subscriptions (filter, qos) + offline QoS1/2 queue
+struct SessionState {
+    subs: Vec<(String, u8)>,
+    offline: VecDeque<(String, Vec<u8>, u8)>, // (topic, payload, qos) awaiting delivery
 }
 
 impl Broker {
     fn new() -> Self {
-        Broker { clients: HashMap::new(), subs: Vec::new(), next_token: 1, drops: 0, dead_pruned: 0, retained: HashMap::new() }
+        Broker { clients: HashMap::new(), subs: Vec::new(), next_token: 1, drops: 0, dead_pruned: 0, retained: HashMap::new(), sessions: HashMap::new() }
     }
 
     fn add_client(&mut self, stream: TcpStream) -> (usize, TcpStream) {
@@ -412,6 +426,27 @@ impl Broker {
             }
         }
         self.dead_pruned += dead;
+        // offline delivery for persistent sessions: QoS1/2 messages matching a
+        // stored session's subscriptions are queued while the client is away
+        // (QoS0 is at-most-once and never stored, per MQTT 3.1.1 §3.1.2.4)
+        if src_qos > 0 {
+            let mut target: Vec<(String, u8)> = Vec::new();
+            for (cid, sess) in &self.sessions {
+                for (filter, sqos) in &sess.subs {
+                    if topic_matches(filter, topic) {
+                        target.push((cid.clone(), *sqos));
+                        break;
+                    }
+                }
+            }
+            for (cid, sqos) in target {
+                if let Some(sess) = self.sessions.get_mut(&cid) {
+                    if sess.offline.len() < OFFLINE_CAP {
+                        sess.offline.push_back((topic.to_string(), payload.to_vec(), src_qos.min(sqos)));
+                    }
+                }
+            }
+        }
         (delivered, 0)
     }
 
@@ -444,6 +479,59 @@ impl Broker {
             .unwrap_or(false);
         if !clean {
             self.publish_lwt(token);
+        }
+        // persistent session: keep subscriptions + queued reliable traffic
+        // in the session store so a later reconnect (clean session = 0) can
+        // restore them. QoS0 queue entries are NOT persisted (at-most-once).
+        let persist = self
+            .clients
+            .get(&token)
+            .map(|c| !c.clean_session && !c.client_id.is_empty())
+            .unwrap_or(false);
+        if persist {
+            let cid = self.clients.get(&token).unwrap().client_id.clone();
+            let subs: Vec<(String, u8)> = self
+                .subs
+                .iter()
+                .filter(|s| s.token == token)
+                .map(|s| (s.filter.clone(), s.qos))
+                .collect();
+            // pull QoS1/2 packets still sitting in the write queue
+            let offline: Vec<(String, Vec<u8>, u8)> = self
+                .clients
+                .get(&token)
+                .unwrap()
+                .write_queue
+                .iter()
+                .filter(|(q1, _)| *q1)
+                .map(|(_, pkt)| {
+                    // decode topic from the queued PUBLISH for later redelivery
+                    let body = &pkt[2..];
+                    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+                    let topic = String::from_utf8_lossy(&body[2..2 + tlen]).to_string();
+                    let mut off = 2 + tlen;
+                    let qos = (pkt[0] & 0x06) >> 1;
+                    if qos > 0 {
+                        off += 2; // packet id
+                    }
+                    (topic, body[off..].to_vec(), qos)
+                })
+                .collect();
+            let entry = self.sessions.entry(cid.clone()).or_insert(SessionState {
+                subs: Vec::new(),
+                offline: VecDeque::new(),
+            });
+            for s in subs {
+                if !entry.subs.contains(&s) {
+                    entry.subs.push(s);
+                }
+            }
+            for m in offline {
+                if entry.offline.len() < OFFLINE_CAP {
+                    entry.offline.push_back(m);
+                }
+            }
+            println!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
         }
         self.subs.retain(|s| s.token != token);
         self.clients.remove(&token);
@@ -558,9 +646,22 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
     for (ptype, flags, body) in pkts {
         match ptype {
             CONNECT => match parse_connect(&body) {
-                Some((cid, ka, will_flag, will_qos, will_retain, will_topic, will_message)) => {
+                Some((cid, ka, will_flag, will_qos, will_retain, will_topic, will_message, clean_session)) => {
+                    // clean session = 1: discard any stored session for this id.
+                    // clean session = 0: restore the stored session's subscriptions
+                    // into the new client (offline queue is flushed below, after
+                    // the subscription restore so forwards find the new token).
+                    if clean_session {
+                        broker.sessions.remove(&cid);
+                    } else if let Some(sess) = broker.sessions.get(&cid) {
+                        for (filter, qos) in &sess.subs {
+                            broker.subs.push(Subscription { filter: filter.clone(), token, qos: *qos });
+                            println!("[+] SESSION   {cid} restored sub {filter} (qos {qos})");
+                        }
+                    }
                     let c = broker.clients.get_mut(&token).unwrap();
                     c.client_id = cid.clone();
+                    c.clean_session = clean_session;
                     c.keepalive_deadline = if ka > 0 {
                         Some(Instant::now() + Duration::from_secs((ka as f64 * 1.5) as u64))
                     } else {
@@ -572,7 +673,30 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     c.will_topic = will_topic;
                     c.will_message = will_message;
                     c.queue_qos0(build_connack());
-                    println!("[+] CONNECT  {cid}  (token {token})");
+                    // flush the persistent session's offline queue to the new
+                    // client, at min(queued_qos, sub_qos) — QoS0 subscriptions
+                    // still get QoS0 copies of queued QoS1/2 messages
+                    if !clean_session {
+                        let restored: Option<(Vec<(String, u8)>, Vec<(String, Vec<u8>, u8)>)> =
+                            broker.sessions.get(&cid).map(|s| (s.subs.clone(), s.offline.iter().cloned().collect()));
+                        if let Some((subs, queued)) = restored {
+                            for (qtopic, qpayload, qqos) in queued {
+                                let mut dqos = qqos;
+                                // cap to what this client's subs allow
+                                for (filter, sqos) in &subs {
+                                    if topic_matches(filter, &qtopic) {
+                                        dqos = dqos.min(*sqos);
+                                        break;
+                                    }
+                                }
+                                if broker.deliver_to(token, &qtopic, &qpayload, dqos, false).is_err() {
+                                    return Err("client dropped during session flush".into());
+                                }
+                            }
+                        }
+                        broker.sessions.remove(&cid); // delivered, session now lives on the socket
+                    }
+                    println!("[+] CONNECT  {cid}  (token {token}, clean={clean_session})");
                 }
                 None => return Err("bad CONNECT".into()),
             },
@@ -868,6 +992,7 @@ fn main() {
                                     will_topic: String::new(),
                                     will_message: Vec::new(),
                                     clean_disconnect: false,
+                                    clean_session: true, // default: clean; CONNECT overrides
                                 };
                                 broker.clients.insert(token, client);
                                 let c = broker.clients.get_mut(&token).unwrap();
