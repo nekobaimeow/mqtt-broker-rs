@@ -147,23 +147,60 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 }
 
 // ---- packet parsers (same logic as the threaded broker) ----
-fn parse_connect(body: &[u8]) -> Option<(String, u16)> {
-    if body.len() < 10 {
-        return None;
+fn parse_connect(body: &[u8]) -> Option<(String, u16, bool, u8, bool, String, Vec<u8>)> {
+    if body.len() < 12 {
+        return None; // Need at least protocol name/flags/keepalive + client id (min 4+1+2+1+2 = 10)
     }
     let plen = u16::from_be_bytes([body[0], body[1]]) as usize;
     if body.len() < 6 + plen + 2 {
         return None;
     }
-    let keepalive = u16::from_be_bytes([body[4 + plen], body[5 + plen]]);
-    let mut pos = 6 + plen;
+    let flags = body[9 + plen]; // Flags byte at position 9 + protocol name length
+    let keepalive = u16::from_be_bytes([body[10 + plen], body[11 + plen]]);
+    let mut pos = 12 + plen;
+    
+    // Parse client id
     let clen = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
     if pos + clen > body.len() {
         return None;
     }
     let cid = String::from_utf8_lossy(&body[pos..pos + clen]).to_string();
-    Some((cid, keepalive))
+    pos += clen;
+    
+    // Parse will flag, QoS, retain, topic, message
+    let will_flag = (flags >> 2) & 0x01 == 1;
+    let will_qos = (flags >> 3) & 0x03; // 2 bits for QoS
+    let will_retain = (flags >> 5) & 0x01 == 1;
+    
+    if will_flag {
+        // Will topic
+        if pos + 2 > body.len() {
+            return None;
+        }
+        let wlen = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2;
+        if pos + wlen > body.len() {
+            return None;
+        }
+        let wtopic = String::from_utf8_lossy(&body[pos..pos + wlen]).to_string();
+        pos += wlen;
+        
+        // Will message
+        if pos + 2 > body.len() {
+            return None;
+        }
+        let mlen = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2;
+        if pos + mlen > body.len() {
+            return None;
+        }
+        let wmsg = body[pos..pos + mlen].to_vec();
+        
+        Some((cid, keepalive, will_flag, will_qos as u8, will_retain, wtopic, wmsg))
+    } else {
+        Some((cid, keepalive, false, 0, false, String::new(), Vec::new()))
+    }
 }
 
 fn parse_subscribe(body: &[u8]) -> Option<(u16, Vec<(String, u8)>)> {
@@ -264,6 +301,12 @@ struct Client {
     next_pid: u16,                     // QoS1/2 packet-id allocator (1..=65535)
     in_flight: HashMap<u16, InFlight>, // pid -> outbound ack state
     received_qos2: HashMap<u16, ()>,   // inbound QoS2 pids seen (dedup until PUBREL)
+    // LWT (Last Will and Testament) support per MQTT 3.1.1 §3.1.3
+    will_flag: bool,
+    will_qos: u8,
+    will_retain: bool,
+    will_topic: String,
+    will_message: Vec<u8>,
 }
 
 impl Client {
@@ -368,6 +411,25 @@ impl Broker {
         }
         self.dead_pruned += dead;
         (delivered, 0)
+    }
+
+    // Publish a disconnecting client's Last Will (MQTT 3.1.1 §3.1.3).
+    // Must be called BEFORE the client is removed from the map: reads the
+    // will fields off the Client, then publishes through the normal path
+    // (honoring will_retain). No-op when the client had no will.
+    fn publish_lwt(&mut self, token: usize) {
+        let will = match self.clients.get(&token) {
+            Some(c) if c.will_flag => Some((
+                c.will_topic.clone(),
+                c.will_message.clone(),
+                c.will_qos,
+                c.will_retain,
+            )),
+            _ => None,
+        };
+        if let Some((topic, msg, qos, retain)) = will {
+            self.publish(&topic, &msg, qos, retain);
+        }
     }
 
     // deliver one message to a single client at the given forward QoS.
@@ -479,7 +541,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
     for (ptype, flags, body) in pkts {
         match ptype {
             CONNECT => match parse_connect(&body) {
-                Some((cid, ka)) => {
+                Some((cid, ka, will_flag, will_qos, will_retain, will_topic, will_message)) => {
                     let c = broker.clients.get_mut(&token).unwrap();
                     c.client_id = cid.clone();
                     c.keepalive_deadline = if ka > 0 {
@@ -487,6 +549,11 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     } else {
                         None
                     };
+                    c.will_flag = will_flag;
+                    c.will_qos = will_qos;
+                    c.will_retain = will_retain;
+                    c.will_topic = will_topic;
+                    c.will_message = will_message;
                     c.queue_qos0(build_connack());
                     println!("[+] CONNECT  {cid}  (token {token})");
                 }
@@ -685,6 +752,7 @@ fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
     };
     if socket_dead {
         broker.subs.retain(|s| s.token != token);
+        broker.publish_lwt(token);
         broker.clients.remove(&token);
         return;
     }
@@ -776,6 +844,12 @@ fn main() {
                                     next_pid: 1,
                                     in_flight: HashMap::new(),
                                     received_qos2: HashMap::new(),
+                                    // LWT fields initialized to defaults
+                                    will_flag: false,
+                                    will_qos: 0,
+                                    will_retain: false,
+                                    will_topic: String::new(),
+                                    will_message: Vec::new(),
                                 };
                                 broker.clients.insert(token, client);
                                 let c = broker.clients.get_mut(&token).unwrap();
