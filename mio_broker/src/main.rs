@@ -361,15 +361,103 @@ impl Client {
     }
 }
 
+// ---- wildcard subscription trie ----
+// A topic-level trie indexes every wildcard filter (one containing + or #) so
+// publish() can walk only the branches of the topic that could match, rather
+// than scanning every wildcard subscription. node.children holds exact-level
+// continuations, node.plus is the single-level-wildcard (+) continuation, and
+// node.hash_subs holds subscriptions whose filter has # directly below this
+// node (i.e. matches this node's entire remaining subtree). node.ends holds
+// subscriptions whose filter stops exactly at this node.
+#[derive(Default)]
+struct TrieNode {
+    children: HashMap<String, TrieNode>,
+    plus: Option<Box<TrieNode>>,
+    ends: Vec<usize>,
+    hash_subs: Vec<usize>,
+}
+
+#[derive(Default)]
+struct Trie {
+    root: TrieNode,
+}
+
+impl Trie {
+    fn new() -> Self {
+        Trie { root: TrieNode::default() }
+    }
+
+    fn clear(&mut self) {
+        self.root = TrieNode::default();
+    }
+
+    // Register a wildcard filter's index. `levels` is the filter split on '/'.
+    fn insert(&mut self, idx: usize, levels: &[&str]) {
+        let mut node = &mut self.root;
+        let mut i = 0;
+        while i < levels.len() {
+            let lvl = levels[i];
+            if lvl == "#" {
+                // # must be the last level; it matches this node's whole subtree.
+                node.hash_subs.push(idx);
+                return;
+            }
+            if lvl == "+" {
+                node = &mut *node.plus.get_or_insert_with(Box::default);
+                i += 1;
+                continue;
+            }
+            node = node.children.entry(lvl.to_string()).or_default();
+            i += 1;
+        }
+        node.ends.push(idx);
+    }
+
+    // Walk the topic levels, appending every candidate subscription index whose
+    // filter could match `topic`. Candidates are a superset of true matches: the
+    // caller still runs topic_matches() as the final authority. `calls` counts
+    // how many candidates were emitted (for the regression counter).
+    fn collect(&self, topic: &str, out: &mut Vec<usize>, calls: &mut u64) {
+        let levels: Vec<&str> = topic.split('/').collect();
+        self.collect_node(&self.root, &levels, 0, out, calls);
+    }
+
+    fn collect_node(&self, node: &TrieNode, levels: &[&str], t: usize, out: &mut Vec<usize>, calls: &mut u64) {
+        // #-continuation subscriptions match the whole remaining subtree.
+        if !node.hash_subs.is_empty() {
+            out.extend_from_slice(&node.hash_subs);
+            *calls += node.hash_subs.len() as u64;
+        }
+        if t >= levels.len() {
+            // Topic exhausted: only filters ending exactly here can still match.
+            if !node.ends.is_empty() {
+                out.extend_from_slice(&node.ends);
+                *calls += node.ends.len() as u64;
+            }
+            return;
+        }
+        // The single-level wildcard (+) consumes exactly this topic level.
+        if let Some(plus) = &node.plus {
+            self.collect_node(plus, levels, t + 1, out, calls);
+        }
+        // Exact level child for the current topic level.
+        if let Some(child) = node.children.get(levels[t]) {
+            self.collect_node(child, levels, t + 1, out, calls);
+        }
+    }
+}
+
 struct Broker {
     clients: HashMap<usize, Client>,
     subs: Vec<Subscription>,
     // two-tier index over `subs` to speed up publish fan-out:
     //  - subs_exact maps an exact filter (no + or #) to indices into subs
-    //  - subs_wild holds indices whose filter contains + or #
+    //  - subs_wild is a trie over topic levels for filters containing + or #,
+    //    so wildcard publish walks only matching branches instead of scanning
+    //    every wildcard subscription.
     // Both are rebuilt by rebuild_index() when subs is structurally changed.
     subs_exact: HashMap<String, Vec<usize>>,
-    subs_wild: Vec<usize>,
+    subs_wild: Trie,
     next_token: usize,
     drops: u64,
     dead_pruned: u64,
@@ -399,7 +487,7 @@ impl Broker {
             clients: HashMap::new(),
             subs: Vec::new(),
             subs_exact: HashMap::new(),
-            subs_wild: Vec::new(),
+            subs_wild: Trie::new(),
             next_token: 1,
             drops: 0,
             dead_pruned: 0,
@@ -433,7 +521,8 @@ impl Broker {
         let idx = self.subs.len();
         self.subs.push(Subscription { filter: filter.clone(), token, qos });
         if Self::is_wild_filter(&filter) {
-            self.subs_wild.push(idx);
+            let levels: Vec<&str> = filter.split('/').collect();
+            self.subs_wild.insert(idx, &levels);
         } else {
             self.subs_exact.entry(filter).or_default().push(idx);
         }
@@ -446,7 +535,8 @@ impl Broker {
         self.subs_wild.clear();
         for (idx, s) in self.subs.iter().enumerate() {
             if Self::is_wild_filter(&s.filter) {
-                self.subs_wild.push(idx);
+                let levels: Vec<&str> = s.filter.split('/').collect();
+                self.subs_wild.insert(idx, &levels);
             } else {
                 self.subs_exact.entry(s.filter.clone()).or_default().push(idx);
             }
@@ -469,18 +559,25 @@ impl Broker {
         let mut delivered = 0usize;
         let mut dead: u64 = 0;
         // Candidate indices from the two-tier index: exact-match subscriptions
-        // come from the map with an O(1) hash lookup; only possibly-matching
-        // wildcard subscriptions still need topic_matches(). Each subscription
-        // is indexed in exactly one tier, so nothing is visited twice.
+        // come from the map with an O(1) hash lookup; possibly-matching
+        // wildcard subscriptions come from walking only the trie branches that
+        // the topic's levels visit (pruning unrelated wildcards entirely). Each
+        // subscription is indexed in exactly one tier, so nothing is visited
+        // twice. Candidates are a superset: topic_matches() below is the final
+        // authority, so exact routing semantics are preserved unchanged.
         let mut idxs: Vec<usize> = Vec::new();
         if let Some(exact) = self.subs_exact.get(topic) {
             idxs.extend_from_slice(exact);
         }
-        for &wi in &self.subs_wild {
-            if topic_matches(&self.subs[wi].filter, topic) {
-                idxs.push(wi);
-            }
-        }
+        let mut _pruned = 0u64; // trie reports candidates that escaped pruning
+        self.subs_wild.collect(topic, &mut idxs, &mut _pruned);
+        // The trie yields a superset (e.g. a # subtree node is reached even when
+        // the topic's remaining depth is bounded, or + end-continuations). Run
+        // the existing topic_matches() on each candidate so routing semantics
+        // are byte-for-byte identical to the previous flat scan. The trie has
+        // already pruned unrelated branches: `calls` is the number of candidates
+        // that escaped pruning, far below the total wildcard count.
+        idxs.retain(|&wi| topic_matches(&self.subs[wi].filter, topic));
         // Process in descending index order so swap_remove() (which pulls the
         // last element into the removed slot) never invalidates a still-pending
         // lower index. Delivery order may change; coverage does not.

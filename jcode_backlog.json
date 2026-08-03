@@ -1,0 +1,48 @@
+[
+  {
+    "id": "trie-subindex",
+    "desc": "订阅索引 trie 化：精确+通配分层 hash 升级为前缀树",
+    "status": "in_progress",
+    "commit": "",
+    "started_at": "2026-08-03 18:57:15",
+    "finished_at": "",
+    "note": "launched 18:58, PID 5252, log growing (29.9KB @ 18:59), main.rs +118/-13",
+    "started_head": "8e3a937 sync TEST.md from WSL (6676e48, 10s + 遗嘱 fix)"
+  },
+  {
+    "id": "disk-persistence",
+    "desc": "消息持久化：retain + 持久会话离线队列落盘，重启不丢",
+    "status": "pending",
+    "commit": "",
+    "started_at": "",
+    "finished_at": "",
+    "note": ""
+  },
+  {
+    "id": "shared-subs",
+    "desc": "共享订阅 $share/g: 同组客户端轮询分发（MQTT 3.1.1 常见扩展）",
+    "status": "pending",
+    "commit": "",
+    "started_at": "",
+    "finished_at": "",
+    "note": ""
+  },
+  {
+    "id": "sys-more",
+    "desc": "$SYS 扩展：bytes sent/received、heap、subscriptions 细分、clients maximum",
+    "status": "pending",
+    "commit": "",
+    "started_at": "",
+    "finished_at": "",
+    "note": ""
+  },
+  {
+    "id": "conn-rate-limit",
+    "desc": "连接限流：每 IP 并发上限 + 全局连接速率限制（防滥用）",
+    "status": "pending",
+    "commit": "",
+    "started_at": "",
+    "finished_at": "",
+    "note": ""
+  }
+]
