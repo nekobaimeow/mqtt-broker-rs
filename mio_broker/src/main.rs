@@ -370,6 +370,14 @@ struct Broker {
     retained: HashMap<String, (Vec<u8>, u8)>, // topic -> (payload, qos)
     // persistent sessions (clean session = 0), keyed by client_id
     sessions: HashMap<String, SessionState>,
+    // $SYS broker statistics (Mosquitto-style)
+    sys_clients_total: u64,
+    sys_msgs_received: u64,
+    sys_msgs_sent: u64,
+    sys_pub_received: u64,
+    sys_pub_sent: u64,
+    sys_start: Instant,
+    sys_last_publish: Instant,
 }
 
 // persistent session state: subscriptions (filter, qos) + offline QoS1/2 queue
@@ -380,7 +388,23 @@ struct SessionState {
 
 impl Broker {
     fn new() -> Self {
-        Broker { clients: HashMap::new(), subs: Vec::new(), next_token: 1, drops: 0, dead_pruned: 0, retained: HashMap::new(), sessions: HashMap::new() }
+        let now = Instant::now();
+        Broker {
+            clients: HashMap::new(),
+            subs: Vec::new(),
+            next_token: 1,
+            drops: 0,
+            dead_pruned: 0,
+            retained: HashMap::new(),
+            sessions: HashMap::new(),
+            sys_clients_total: 0,
+            sys_msgs_received: 0,
+            sys_msgs_sent: 0,
+            sys_pub_received: 0,
+            sys_pub_sent: 0,
+            sys_start: now,
+            sys_last_publish: now,
+        }
     }
 
     fn add_client(&mut self, stream: TcpStream) -> (usize, TcpStream) {
@@ -533,34 +557,61 @@ impl Broker {
             }
             println!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
         }
-        self.subs.retain(|s| s.token != token);
-        self.clients.remove(&token);
+       self.subs.retain(|s| s.token != token);
+       self.clients.remove(&token);
+   }
+
+    // Publish $SYS broker topics as retained messages every 10s.
+    // Uses the existing publish() path so retained storage and
+    // delivery to matching subscribers work automatically.
+    fn publish_sys_topics(&mut self) {
+        let ver = env!("CARGO_PKG_VERSION");
+        let uptime = self.sys_start.elapsed().as_secs();
+        let connected = self.clients.len() as u64;
+        let total_subs: usize = self.subs.len();
+
+        let topics: &[(&str, String, u8)] = &[
+            ("$SYS/broker/version", format!("mqtt-broker-rs {}", ver), 0),
+            ("$SYS/broker/uptime", uptime.to_string(), 0),
+            ("$SYS/broker/clients/connected", connected.to_string(), 0),
+            ("$SYS/broker/clients/total", self.sys_clients_total.to_string(), 0),
+            ("$SYS/broker/messages/received", self.sys_msgs_received.to_string(), 0),
+            ("$SYS/broker/messages/sent", self.sys_msgs_sent.to_string(), 0),
+            ("$SYS/broker/messages/publish/received", self.sys_pub_received.to_string(), 0),
+            ("$SYS/broker/messages/publish/sent", self.sys_pub_sent.to_string(), 0),
+            ("$SYS/broker/subscriptions/count", total_subs.to_string(), 0),
+        ];
+        for (topic, payload, _qos) in topics {
+            let _ = self.publish(topic, payload.as_bytes(), 0, true);
+        }
     }
 
-    // deliver one message to a single client at the given forward QoS.
+   // deliver one message to a single client at the given forward QoS.
     // Err(()) = client was removed (gone, or queue overflow on QoS1/2).
-    fn deliver_to(&mut self, token: usize, topic: &str, payload: &[u8], fwd_qos: u8, retain: bool) -> Result<(), ()> {
-        if fwd_qos == 0 {
-            let pkt = build_forward(topic.as_bytes(), payload, 0, None, false, retain);
-            match self.clients.get_mut(&token) {
-                Some(c) => {
-                    if c.queue_qos0(pkt) {
-                        Ok(())
-                    } else {
-                        Err(()) // QoS0 queue full -> drop connection
-                    }
-                }
-                None => Err(()),
-            }
-        } else {
-            match self.clients.get_mut(&token) {
-                Some(c) => match c.alloc_pid() {
-                    Some(pid) => {
-                        let pkt = build_forward(topic.as_bytes(), payload, fwd_qos, Some(pid), false, retain);
-                        let keep = pkt.clone();
-                        match c.queue_qos1(pkt) {
-                            Ok(()) => {
-                                c.in_flight.insert(
+   fn deliver_to(&mut self, token: usize, topic: &str, payload: &[u8], fwd_qos: u8, retain: bool) -> Result<(), ()> {
+       if fwd_qos == 0 {
+           let pkt = build_forward(topic.as_bytes(), payload, 0, None, false, retain);
+           match self.clients.get_mut(&token) {
+               Some(c) => {
+                   if c.queue_qos0(pkt) {
+                        self.sys_pub_sent += 1;
+                       Ok(())
+                   } else {
+                       Err(()) // QoS0 queue full -> drop connection
+                   }
+               }
+               None => Err(()),
+           }
+       } else {
+           match self.clients.get_mut(&token) {
+               Some(c) => match c.alloc_pid() {
+                   Some(pid) => {
+                       let pkt = build_forward(topic.as_bytes(), payload, fwd_qos, Some(pid), false, retain);
+                       let keep = pkt.clone();
+                       match c.queue_qos1(pkt) {
+                           Ok(()) => {
+                                self.sys_pub_sent += 1;
+                               c.in_flight.insert(
                                     pid,
                                     InFlight {
                                         pkt: keep,
@@ -641,10 +692,11 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             c.read_buf.drain(..consumed);
         }
         (pkts, c.client_id.clone(), c.keepalive_deadline)
-    };
+   };
+   let pkt_count = pkts.len();
 
-    for (ptype, flags, body) in pkts {
-        match ptype {
+   for (ptype, flags, body) in pkts {
+       match ptype {
             CONNECT => match parse_connect(&body) {
                 Some((cid, ka, will_flag, will_qos, will_retain, will_topic, will_message, clean_session)) => {
                     // clean session = 1: discard any stored session for this id.
@@ -697,6 +749,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                         broker.sessions.remove(&cid); // delivered, session now lives on the socket
                     }
                     println!("[+] CONNECT  {cid}  (token {token}, clean={clean_session})");
+                    broker.sys_clients_total += 1;
                 }
                 None => return Err("bad CONNECT".into()),
             },
@@ -757,9 +810,10 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                         }
                         c.queue_qos0(build_pubrec(p));
                     }
-                    if !seen_dup {
-                        let s = String::from_utf8_lossy(&payload);
-                        let (n, _) = broker.publish(&topic, &payload, qos, retain);
+                   if !seen_dup {
+                       let s = String::from_utf8_lossy(&payload);
+                       let (n, _) = broker.publish(&topic, &payload, qos, retain);
+                        broker.sys_pub_received += 1;
                         println!("[>] PUBLISH  {} -> {topic} (qos {qos}{}{}, {}B, delivered to {n}) \"{}\"",
                             client_id,
                             if retain { " retain" } else { "" },
@@ -847,8 +901,9 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             _ => return Err(format!("unknown packet type {ptype}")),
         }
     }
-    let _ = keepalive;
-    Ok(())
+   let _ = keepalive;
+    broker.sys_msgs_received += pkt_count as u64;
+   Ok(())
 }
 
 fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
@@ -897,6 +952,8 @@ fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
         broker.remove_client(token);
         return;
     }
+    // Count packets written to socket for $SYS stats
+    broker.sys_msgs_sent += 1;
     if let Some(c) = broker.clients.get_mut(&token) {
         let interest = if wrote_all {
             Interest::READABLE
@@ -1072,8 +1129,13 @@ fn main() {
                 flush_writes(poll.registry(), &mut broker, t);
             }
         }
-        // keepalive sweep
-        let now = Instant::now();
+      // keepalive sweep
+      let now = Instant::now();
+       // publish $SYS topics every 10 seconds
+       if broker.sys_last_publish.elapsed() >= Duration::from_secs(10) {
+           broker.publish_sys_topics();
+           broker.sys_last_publish = Instant::now();
+       }
         let dead: Vec<usize> = broker
             .clients
             .iter()
