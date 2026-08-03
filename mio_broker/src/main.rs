@@ -5,10 +5,28 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Registry, Token};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+// Hot-path packet logging is gated behind MQTT_VERBOSE=1: println! takes the
+// stdout lock per call, and at 50k+ msg/s that lock becomes the bottleneck.
+// Error-level lines (drops, giveups, slow-loop warnings) always print.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+macro_rules! vlog {
+    ($($arg:tt)*) => {
+        if VERBOSE.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    };
+}
+
 const LISTENER: Token = Token(0);
-const READ_CAP: usize = 65536; // per-connection read buffer cap
+// Flood guard ceiling for the per-connection read buffer. Legal max: one full
+// MAX_PACKET body plus one partial packet's header/body prefix, so 2x MAX_PACKET
+// (2MB). The 64KB drain buffer can push read_buf to 64KB+residue in one shot,
+// so this must stay well above the per-read chunk size.
+const READ_CAP: usize = 2 * MAX_PACKET;
 const MAX_PACKET: usize = 1 << 20; // refuse packets > 1MB (anti-memory-attack)
 const WRITE_QUEUE_CAP: usize = 8192; // bounded outbound queue (QoS0 drop when full)
 const IN_FLIGHT_CAP: usize = 256; // max unacked QoS1 per connection (memory guard)
@@ -57,48 +75,28 @@ fn build_connack() -> Vec<u8> {
     vec![(CONNACK << 4), 0x02, 0x00, 0x00]
 }
 fn build_suback(pid: u16, grants: &[u8]) -> Vec<u8> {
-    let mut pkt = vec![(SUBACK << 4)];
-    let mut body = pid.to_be_bytes().to_vec();
-    body.extend_from_slice(grants);
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
+    let mut pkt = Vec::with_capacity(3 + grants.len());
+    pkt.push(SUBACK << 4);
+    pkt.push((2 + grants.len()) as u8);
+    pkt.extend_from_slice(&pid.to_be_bytes());
+    pkt.extend_from_slice(grants);
     pkt
 }
 fn build_unsuback(pid: u16) -> Vec<u8> {
-    let mut pkt = vec![(UNSUBACK << 4)];
-    let mut body = pid.to_be_bytes().to_vec();
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
-    pkt
+    vec![(UNSUBACK << 4), 0x02, (pid >> 8) as u8, pid as u8]
 }
 fn build_puback(pid: u16) -> Vec<u8> {
-    let mut pkt = vec![(PUBACK << 4)];
-    let mut body = pid.to_be_bytes().to_vec();
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
-    pkt
+    vec![(PUBACK << 4), 0x02, (pid >> 8) as u8, pid as u8]
 }
 fn build_pubrec(pid: u16) -> Vec<u8> {
-    let mut pkt = vec![(PUBREC << 4)];
-    let mut body = pid.to_be_bytes().to_vec();
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
-    pkt
+    vec![(PUBREC << 4), 0x02, (pid >> 8) as u8, pid as u8]
 }
 fn build_pubrel(pid: u16) -> Vec<u8> {
     // PUBREL fixed header flags must be 0x02
-    let mut pkt = vec![(PUBREL << 4) | 0x02];
-    let mut body = pid.to_be_bytes().to_vec();
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
-    pkt
+    vec![(PUBREL << 4) | 0x02, 0x02, (pid >> 8) as u8, pid as u8]
 }
 fn build_pubcomp(pid: u16) -> Vec<u8> {
-    let mut pkt = vec![(PUBCOMP << 4)];
-    let mut body = pid.to_be_bytes().to_vec();
-    encode_rem(body.len(), &mut pkt);
-    pkt.extend_from_slice(&body);
-    pkt
+    vec![(PUBCOMP << 4), 0x02, (pid >> 8) as u8, pid as u8]
 }
 fn build_pingresp() -> Vec<u8> {
     vec![(PINGRESP << 4), 0x00]
@@ -272,6 +270,20 @@ fn parse_publish(flags: u8, body: &[u8]) -> Option<(String, u8, Option<u16>, Vec
     };
     let payload = body[pos..].to_vec();
     Some((topic, qos, pid, payload, retain))
+}
+
+// Extract ONLY the packet id from a PUBLISH body (topic len + topic + pid).
+// Used by the no-subscriber fast path, where topic/payload are never inspected
+// so the String + Vec allocations in parse_publish are skipped entirely.
+fn parse_pid_only(body: &[u8]) -> Option<u16> {
+    if body.len() < 4 {
+        return None;
+    }
+    let tlen = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() < 2 + tlen + 2 {
+        return None;
+    }
+    Some(u16::from_be_bytes([body[2 + tlen], body[2 + tlen + 1]]))
 }
 
 // ---- per-connection state ----
@@ -763,6 +775,14 @@ impl Broker {
                 self.dirty = true;
             }
         }
+        // Fast path: zero subscribers AND zero persistent sessions means the
+        // message has nowhere to go. Retained storage was handled above; skip
+        // all routing machinery (index walk, candidate vec, sort, per-sub
+        // queueing). This is the common case for pub-only benchmarks and
+        // telemetry feeds with no consumers.
+        if self.subs.is_empty() && self.sessions.is_empty() {
+            return (0, 0);
+        }
         let mut delivered = 0usize;
         let mut dead: u64 = 0;
         // Candidate indices from the two-tier index: exact-match subscriptions
@@ -913,7 +933,7 @@ impl Broker {
                     entry.offline.push_back(m);
                 }
             }
-            println!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
+            vlog!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
             self.dirty = true;
         }
        self.subs.retain(|s| s.token != token);
@@ -1005,56 +1025,72 @@ impl Broker {
 // Try to parse and handle one packet from read_buf. Returns Err on protocol
 // violation (connection should be closed).
 fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
-    let (pkts, client_id, keepalive) = {
+    // Zero-copy read: swap the whole read buffer out of the client (no alloc,
+    // no O(n) drain memmove) and parse it locally. Packet bodies are referenced
+    // by (offset, len) into this local buffer instead of being copied per
+    // packet — one PUBLISH burst of 100 packets used to cost 100 body Vec
+    // allocations plus a drain() memmove. The local `buf` is independent of
+    // `broker`, so the processing loop below can mutate broker while holding
+    // body slices borrowed from `buf`.
+    let mut buf = {
         let c = broker.clients.get_mut(&token).unwrap();
-        let mut pkts = Vec::new();
-        let mut consumed = 0usize;
-        let mut bad = None;
-        loop {
-            let buf = &c.read_buf[consumed..];
-            if buf.is_empty() {
+        std::mem::take(&mut c.read_buf)
+    };
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let mut pkts: Vec<(u8, u8, usize, usize)> = Vec::new(); // (type, flags, body_off, body_len)
+    let mut consumed = 0usize;
+    let mut bad = None;
+    loop {
+        let b = &buf[consumed..];
+        if b.is_empty() {
+            break;
+        }
+        let ptype = b[0] >> 4;
+        let flags = b[0] & 0x0f;
+        // decode remaining length
+        let mut rem: usize = 0;
+        let mut mult: usize = 1;
+        let mut i = 1;
+        let mut complete = false;
+        while i < b.len() && i <= 4 {
+            rem += ((b[i] & 0x7f) as usize) * mult;
+            if b[i] & 0x80 == 0 {
+                complete = true;
                 break;
             }
-            let ptype = buf[0] >> 4;
-            let flags = buf[0] & 0x0f;
-            // decode remaining length
-            let mut rem: usize = 0;
-            let mut mult: usize = 1;
-            let mut i = 1;
-            let mut complete = false;
-            while i < buf.len() && i <= 4 {
-                rem += ((buf[i] & 0x7f) as usize) * mult;
-                if buf[i] & 0x80 == 0 {
-                    complete = true;
-                    break;
-                }
-                mult *= 128;
-                i += 1;
-            }
-            if !complete {
-                break; // need more bytes
-            }
-            if rem > MAX_PACKET {
-                bad = Some(format!("packet too large ({rem}B)"));
-                break;
-            }
-            if buf.len() < i + 1 + rem {
-                break; // body incomplete, wait for more
-            }
-            let body = buf[i + 1..i + 1 + rem].to_vec();
-            consumed += i + 1 + rem;
-            pkts.push((ptype, flags, body));
+            mult *= 128;
+            i += 1;
         }
-        if let Some(e) = bad {
-            return Err(e);
+        if !complete {
+            break; // need more bytes
         }
-        // drain consumed bytes
-        if consumed > 0 {
-            c.read_buf.drain(..consumed);
+        if rem > MAX_PACKET {
+            bad = Some(format!("packet too large ({rem}B)"));
+            break;
         }
-        (pkts, c.client_id.clone(), c.keepalive_deadline)
-   };
-   let pkt_count = pkts.len();
+        if b.len() < i + 1 + rem {
+            break; // body incomplete, wait for more
+        }
+        let bstart = consumed + i + 1;
+        consumed += i + 1 + rem;
+        pkts.push((ptype, flags, bstart, rem));
+    }
+    let pkt_count = pkts.len();
+    // keep the unconsumed tail (partial packet) in the client's read buffer
+    if consumed < buf.len() {
+        let rest = buf.split_off(consumed);
+        broker.clients.get_mut(&token).unwrap().read_buf = rest;
+    }
+    let client_id = broker
+        .clients
+        .get(&token)
+        .map(|c| c.client_id.clone())
+        .unwrap_or_default();
+    if let Some(e) = bad {
+        return Err(e);
+    }
 
    // MQTT-3.1.2-23: broker must treat ANY packet as liveness proof. Refresh the
    // keepalive deadline on every received packet so bursty publishers that skip
@@ -1067,7 +1103,8 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
        }
    }
 
-   for (ptype, flags, body) in pkts {
+   for (ptype, flags, bstart, blen) in pkts {
+       let body = &buf[bstart..bstart + blen];
        match ptype {
             CONNECT => match parse_connect(&body) {
                 Some((cid, ka, will_flag, will_qos, will_retain, will_topic, will_message, clean_session)) => {
@@ -1085,7 +1122,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                         };
                         for (filter, qos) in restore_subs {
                             broker.add_sub(filter.clone(), token, qos);
-                            println!("[+] SESSION   {cid} restored sub {filter} (qos {qos})");
+                            vlog!("[+] SESSION   {cid} restored sub {filter} (qos {qos})");
                         }
                     }
                     let c = broker.clients.get_mut(&token).unwrap();
@@ -1128,7 +1165,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                             broker.dirty = true; // flushed queue, session moved to socket
                         }
                     }
-                    println!("[+] CONNECT  {cid}  (token {token}, clean={clean_session})");
+                    vlog!("[+] CONNECT  {cid}  (token {token}, clean={clean_session})");
                     broker.sys_clients_total += 1;
                 }
                 None => return Err("bad CONNECT".into()),
@@ -1139,7 +1176,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     for (filter, qos) in &topics {
                         broker.add_sub(filter.clone(), token, *qos);
                         grants.push(*qos);
-                        println!("[+] SUBSCRIBE {} -> {filter} (qos {qos})", client_id);
+                        vlog!("[+] SUBSCRIBE {} -> {filter} (qos {qos})", client_id);
                         // retained delivery: every stored message matching this
                         // filter is sent immediately, at min(retained_qos, sub_qos)
                         let hits: Vec<(String, Vec<u8>, u8)> = broker
@@ -1166,14 +1203,45 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     broker.subs.retain(|s| !(s.token == token && filters.contains(&s.filter)));
                     broker.rebuild_index();
                     for f in &filters {
-                        println!("[-] UNSUBSCRIBE {} -> {f}", client_id);
+                        vlog!("[-] UNSUBSCRIBE {} -> {f}", client_id);
                     }
                     let c = broker.clients.get_mut(&token).unwrap();
                     c.queue_qos0(build_unsuback(pid));
                 }
                 None => return Err("bad UNSUBSCRIBE".into()),
             },
-            PUBLISH => match parse_publish(flags, &body) {
+            PUBLISH => {
+                let qos = (flags >> 1) & 0x03;
+                let retain = flags & 0x01 != 0;
+                // No-subscriber fast path: with zero subscribers AND zero
+                // persistent sessions, a non-retained PUBLISH has nowhere to
+                // go — only the ack matters. QoS1/2 need the packet id, so
+                // decode just that and skip parse_publish's String+Vec
+                // allocations (topic + payload copies). QoS0 needs nothing.
+                let no_routing = !retain && broker.subs.is_empty() && broker.sessions.is_empty();
+                if no_routing {
+                    let mut is_dup = false;
+                    if qos == 1 {
+                        let p = parse_pid_only(&body).ok_or("bad PUBLISH")?;
+                        let c = broker.clients.get_mut(&token).unwrap();
+                        c.queue_qos0(build_puback(p));
+                    } else if qos == 2 {
+                        let p = parse_pid_only(&body).ok_or("bad PUBLISH")?;
+                        let c = broker.clients.get_mut(&token).unwrap();
+                        if c.received_qos2.contains_key(&p) {
+                            is_dup = true;
+                        } else {
+                            c.received_qos2.insert(p, ());
+                        }
+                        c.queue_qos0(build_pubrec(p));
+                    }
+                    if !is_dup {
+                        broker.sys_pub_received += 1;
+                    }
+                    vlog!("[>] PUBLISH  {} (no-subs fast path, qos {qos}{})", client_id,
+                        if is_dup { " dup" } else { "" });
+                } else {
+                match parse_publish(flags, &body) {
                 Some((topic, qos, pid, payload, retain)) => {
                     // QoS1: ack immediately. QoS2: ack (PUBREC) but dedupe —
                     // a repeated PID (publisher retry before our PUBREL reached
@@ -1195,7 +1263,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                        let s = String::from_utf8_lossy(&payload);
                        let (n, _) = broker.publish(&topic, &payload, qos, retain);
                         broker.sys_pub_received += 1;
-                        println!("[>] PUBLISH  {} -> {topic} (qos {qos}{}{}, {}B, delivered to {n}) \"{}\"",
+                        vlog!("[>] PUBLISH  {} -> {topic} (qos {qos}{}{}, {}B, delivered to {n}) \"{}\"",
                             client_id,
                             if retain { " retain" } else { "" },
                             if seen_dup { " dup" } else { "" },
@@ -1208,13 +1276,15 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     }
                 }
                 None => return Err("bad PUBLISH".into()),
-            },
+                }
+                }
+            }
             PUBACK => {
                 if body.len() >= 2 {
                     let pid = u16::from_be_bytes([body[0], body[1]]);
                     let c = broker.clients.get_mut(&token).unwrap();
                     if c.in_flight.remove(&pid).is_some() {
-                        println!("[~] PUBACK   {} -> pid {pid}", client_id);
+                        vlog!("[~] PUBACK   {} -> pid {pid}", client_id);
                     }
                 } else {
                     return Err("bad PUBACK".into());
@@ -1236,7 +1306,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                         }
                     }
                     if rel {
-                        println!("[~] PUBREC   {} -> pid {pid} (-> PUBREL)", client_id);
+                        vlog!("[~] PUBREC   {} -> pid {pid} (-> PUBREL)", client_id);
                         let c = broker.clients.get_mut(&token).unwrap();
                         c.queue_qos0(build_pubrel(pid));
                     }
@@ -1251,7 +1321,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     let c = broker.clients.get_mut(&token).unwrap();
                     c.received_qos2.remove(&pid);
                     c.queue_qos0(build_pubcomp(pid));
-                    println!("[~] PUBREL   {} -> pid {pid} (-> PUBCOMP)", client_id);
+                    vlog!("[~] PUBREL   {} -> pid {pid} (-> PUBCOMP)", client_id);
                 } else {
                     return Err("bad PUBREL".into());
                 }
@@ -1262,7 +1332,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     let pid = u16::from_be_bytes([body[0], body[1]]);
                     let c = broker.clients.get_mut(&token).unwrap();
                     if c.in_flight.remove(&pid).is_some() {
-                        println!("[~] PUBCOMP  {} -> pid {pid}", client_id);
+                        vlog!("[~] PUBCOMP  {} -> pid {pid}", client_id);
                     }
                 } else {
                     return Err("bad PUBCOMP".into());
@@ -1271,10 +1341,10 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             PINGREQ => {
                 let c = broker.clients.get_mut(&token).unwrap();
                 c.queue_qos0(build_pingresp());
-                println!("[~] PINGREQ  {} -> PINGRESP", client_id);
+                vlog!("[~] PINGREQ  {} -> PINGRESP", client_id);
             }
             DISCONNECT => {
-                println!("[-] DISCONNECT {} (token {token})", client_id);
+                vlog!("[-] DISCONNECT {} (token {token})", client_id);
                 let c = broker.clients.get_mut(&token).unwrap();
                 c.clean_disconnect = true;
                 return Err("disconnect".into());
@@ -1282,7 +1352,6 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             _ => return Err(format!("unknown packet type {ptype}")),
         }
     }
-   let _ = keepalive;
     broker.sys_msgs_received += pkt_count as u64;
     // persist retained + session changes made by this batch of packets
     broker.save();
@@ -1352,7 +1421,10 @@ fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
 // fills every subscriber queue and everything gets dropped before any flush).
 // Returns Err if the connection must be closed (EOF, protocol error, flood).
 fn drain_client(broker: &mut Broker, token: usize) -> Result<(), ()> {
-    let mut buf = [0u8; 8192];
+    // 64KB stack buffer: one read should consume the whole kernel buffer on
+    // a bursty publisher. 8KB meant several read syscalls + epoll rounds per
+    // 8KB of traffic, which capped per-connection receive throughput.
+    let mut buf = [0u8; 65536];
     let n = match broker.clients.get_mut(&token).unwrap().stream.read(&mut buf) {
         Ok(0) => return Err(()), // EOF
         Ok(n) => n,
@@ -1388,6 +1460,13 @@ fn main() {
     println!("[mqtt-mio-broker] listening on {addr} (mio {})", env!("CARGO_PKG_VERSION"));
 
     let mut idle_rounds: u32 = 0;
+    let verbose = std::env::var("MQTT_VERBOSE")
+        .map(|v| v == "1" || v == "true" || v == "yes")
+        .unwrap_or(false);
+    VERBOSE.store(verbose, Ordering::Relaxed);
+    if verbose {
+        println!("[mqtt-mio-broker] verbose logging enabled");
+    }
     loop {
         let loop_start = std::time::Instant::now();
         // adaptive poll timeout: 1ms while active (low latency), back off to
@@ -1477,22 +1556,56 @@ fn main() {
                 }
             }
         }
+        // Single pass over all clients collecting: (a) tokens with queued
+        // writes to flush, (b) keepalive-expired tokens, (c) in-flight
+        // retransmissions. Previously this was 3-4 full scans per loop plus a
+        // per-in-flight env-var lookup; now it's one scan with the env value
+        // hoisted out of the loop.
+        let now = Instant::now();
+        let retry_after = qos1_retry_after();
+        let mut pending: Vec<usize> = Vec::new();
+        let mut dead: Vec<usize> = Vec::new();
+        let mut retry: Vec<(usize, u16, Vec<u8>)> = Vec::new();
+        let mut give_up: Vec<(usize, u16)> = Vec::new();
+        for (t, c) in broker.clients.iter() {
+            if !c.write_queue.is_empty() {
+                pending.push(*t);
+            }
+            if let Some(d) = c.keepalive_deadline {
+                if now > d {
+                    dead.push(*t);
+                }
+            }
+            for (pid, inf) in c.in_flight.iter() {
+                if now.duration_since(inf.sent_at) < retry_after {
+                    continue;
+                }
+                if inf.retries >= QOS1_MAX_RETRIES {
+                    give_up.push((*t, *pid));
+                } else if inf.qos2 && inf.await_pubcomp {
+                    // we're waiting for PUBCOMP: retransmit PUBREL (DUP flag)
+                    let mut rel = build_pubrel(*pid);
+                    rel[0] |= 0x08; // DUP bit
+                    retry.push((*t, *pid, rel));
+                } else {
+                    // waiting for PUBACK (QoS1) or PUBREC (QoS2): re-send PUBLISH DUP
+                    let mut dup = inf.pkt.clone();
+                    dup[0] |= 0x08; // DUP bit
+                    retry.push((*t, *pid, dup));
+                }
+            }
+        }
         // eagerly flush any client with queued data (non-blocking). The
         // WRITABLE interest is only a fallback for when the kernel buffer is
         // full — relying on epoll to notice writability adds latency per batch.
-        let pending: Vec<usize> = broker
-            .clients
-            .iter()
-            .filter(|(_, c)| !c.write_queue.is_empty())
-            .map(|(t, _)| *t)
-            .collect();
-        for t in pending {
-            if broker.clients.contains_key(&t) {
-                flush_writes(poll.registry(), &mut broker, t);
+        for t in &pending {
+            if broker.clients.contains_key(t) {
+                flush_writes(poll.registry(), &mut broker, *t);
             }
         }
-        // belt & braces: poll timeout also wakes us to actively drain every
-        // client, in case an epoll READABLE notification is missed
+        // belt & braces: actively drain every client once per loop. epoll
+        // level-triggered notifications should cover this, but the full sweep
+        // guarantees no socket is starved even if a READABLE edge is missed.
         let all_tokens: Vec<usize> = broker.clients.keys().cloned().collect();
         for t in all_tokens {
             if !broker.clients.contains_key(&t) {
@@ -1514,50 +1627,13 @@ fn main() {
                 flush_writes(poll.registry(), &mut broker, t);
             }
         }
-      // keepalive sweep
-      let now = Instant::now();
        // publish $SYS topics every 10 seconds
        if broker.sys_last_publish.elapsed() >= Duration::from_secs(10) {
            broker.publish_sys_topics();
            broker.sys_last_publish = Instant::now();
        }
-        let dead: Vec<usize> = broker
-            .clients
-            .iter()
-            .filter(|(_, c)| match c.keepalive_deadline {
-                Some(d) => now > d,
-                None => false,
-            })
-            .map(|(t, _)| *t)
-            .collect();
         for t in dead {
             broker.remove_client(t);
-        }
-        // retransmission sweep: any in-flight message older than
-        // QOS1_RETRY_AFTER gets re-queued with DUP=1 (QoS1: PUBLISH;
-        // QoS2 awaiting PUBREC: PUBLISH; QoS2 awaiting PUBCOMP: PUBREL).
-        // After QOS1_MAX_RETRIES unanswered retries the client is dropped.
-        let mut retry: Vec<(usize, u16, Vec<u8>)> = Vec::new();
-        let mut give_up: Vec<(usize, u16)> = Vec::new();
-        for (t, c) in broker.clients.iter() {
-            for (pid, inf) in c.in_flight.iter() {
-                if now.duration_since(inf.sent_at) < qos1_retry_after() {
-                    continue;
-                }
-                if inf.retries >= QOS1_MAX_RETRIES {
-                    give_up.push((*t, *pid));
-                } else if inf.qos2 && inf.await_pubcomp {
-                    // we're waiting for PUBCOMP: retransmit PUBREL (DUP flag)
-                    let mut rel = build_pubrel(*pid);
-                    rel[0] |= 0x08; // DUP bit
-                    retry.push((*t, *pid, rel));
-                } else {
-                    // waiting for PUBACK (QoS1) or PUBREC (QoS2): re-send PUBLISH DUP
-                    let mut dup = inf.pkt.clone();
-                    dup[0] |= 0x08; // DUP bit
-                    retry.push((*t, *pid, dup));
-                }
-            }
         }
         for (t, pid, dup) in retry {
             let Some(c) = broker.clients.get_mut(&t) else { continue };
