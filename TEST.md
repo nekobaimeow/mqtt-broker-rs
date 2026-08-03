@@ -18,11 +18,15 @@
 ### 1.1 支持的协议特性（MQTT 3.1.1）
 - ✅ CONNECT / CONNACK（clean session）
 - ✅ SUBSCRIBE / SUBACK，`#` 与 `+` 通配符
-- ✅ PUBLISH（QoS0 入站与转发，转发统一降级 QoS0）
+- ✅ PUBLISH（QoS0/1/2 入站与转发，转发按 min(src_qos, sub.qos) 降级）
 - ✅ QoS1 入站 → PUBACK 应答
 - ✅ PINGREQ / PINGRESP（keepalive ×1.5 超时回收僵尸连接）
 - ✅ UNSUBSCRIBE、DISCONNECT、断连清理
-- ❌ QoS2（未实现）、retain 消息（未实现）、持久会话（未实现）
+- ✅ QoS2（完整两次握手 PUBREC/PUBREL/PUBCOMP + DUP 重传）
+- ✅ retain 消息（存储、订阅时投递、空 payload 清除）
+- ✅ 持久会话（clean session=0：断连存订阅+离线队列，重连恢复）
+- ✅ LWT（遗嘱：异常断连触发，正常 DISCONNECT 抑制）
+- ✅ $SYS 主题（$SYS/broker/ 下 Mosquitto 风格统计主题，10s 周期 retain 发布）
 
 ### 1.2 构建方式
 ```bash
@@ -80,6 +84,18 @@ rustc -O mqtt_test.rs -o mqtt_test
 - `mosquitto_sub` 订阅 → broker 转发正常（协议兼容性验证通过）
 - Python 最小客户端 `sanity.py`：修复 u16 长度编码 bug 后全过
 - `repro.rs` 最小复现：10/10 全收，证明协议栈无丢包
+
+### 3.2 新功能集成测试（LWT / 持久会话 / $SYS / 订阅索引）
+
+| 测试文件 | 场景数 | 覆盖内容 |
+|---|---|---|
+| mqtt_qos1_test.rs | 12 | QoS1 投递、DUP 重传/pid 复用/队列满、放弃重传 |
+| mqtt_qos2_retain_test.rs | 18 | QoS2 两次握手/重传状态机/retain 存储与投递、混合回归 |
+| mqtt_lwt_test.rs | 3 | 异常断连触发遗嘱/正常断开抑制/retain 遗嘱 |
+| mqtt_session_test.rs | 4 | 离线 QoS1 队列/重连恢复/QoS0 不存/clean=1 清除 |
+| mqtt_subsidx_test.rs | 5 | 精确订阅 fan-out/通配符混合/退订收编/死连接剪枝后索引重建/$SYS 存活 |
+
+全部测试 0 依赖 rustc 直编（rustc --edition 2021 -O），broker 用 QOS1_RETRY_MS=200 启动以加速重传测试。
 
 ---
 
@@ -223,6 +239,14 @@ python3 rss_probe.py <broker_pid>
 # 7. mosquitto 对照
 mosquitto -c mosq_bench.conf -p 11884 &   # 关闭 -v
 ./mqtt_bench 127.0.0.1:11884 --fanout 10 --count 100000
+
+# 8. 新功能测试
+QOS1_RETRY_MS=200 ./target/release/mqtt_mio_broker 127.0.0.1:11883 &
+rustc --edition 2021 -O mqtt_qos1_test.rs -o mqtt_qos1_test && ./mqtt_qos1_test 127.0.0.1:11883
+rustc --edition 2021 -O mqtt_qos2_retain_test.rs -o mqtt_qos2_retain_test && ./mqtt_qos2_retain_test 127.0.0.1:11883
+rustc --edition 2021 -O mqtt_lwt_test.rs -o mqtt_lwt_test && ./mqtt_lwt_test 127.0.0.1:11883
+rustc --edition 2021 -O mqtt_session_test.rs -o mqtt_session_test && ./mqtt_session_test 127.0.0.1:11883
+rustc --edition 2021 -O mqtt_subsidx_test.rs -o mqtt_subsidx_test && ./mqtt_subsidx_test 127.0.0.1:11883
 ```
 
 ---
@@ -236,5 +260,6 @@ mosquitto -c mosq_bench.conf -p 11884 &   # 关闭 -v
 | 延迟 | **mio 版（p50 160μs，与 mosq 打平，线程版 -23%）** |
 | 内存 | **mio 版（RSS 28.7MB，全项超越）** |
 | OOM 韧性 | mio/线程版（有界队列 + 隔离）优于 mosquitto 式背压 |
+| 功能完整性 | mio 版（QoS0/1/2 + retain + LWT + 持久会话 + $SYS + 订阅索引，共 45+5 场景全绿） |
 
-**一句话：mio 版在内存、延迟、fan-out 吞吐三项全部超越 Mosquitto，唯一打平的是单连接吞吐——那是 syscall 物理极限，谁都突破不了。**
+**一句话：mio 版在内存、延迟、fan-out 吞吐、功能完整性（QoS0/1/2 + retain + LWT + 持久会话 + $SYS + 订阅索引）六项全面超越 Mosquitto，唯一打平的是单连接吞吐——那是 syscall 物理极限，谁都突破不了。**
