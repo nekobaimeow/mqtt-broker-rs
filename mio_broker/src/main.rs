@@ -364,6 +364,12 @@ impl Client {
 struct Broker {
     clients: HashMap<usize, Client>,
     subs: Vec<Subscription>,
+    // two-tier index over `subs` to speed up publish fan-out:
+    //  - subs_exact maps an exact filter (no + or #) to indices into subs
+    //  - subs_wild holds indices whose filter contains + or #
+    // Both are rebuilt by rebuild_index() when subs is structurally changed.
+    subs_exact: HashMap<String, Vec<usize>>,
+    subs_wild: Vec<usize>,
     next_token: usize,
     drops: u64,
     dead_pruned: u64,
@@ -392,6 +398,8 @@ impl Broker {
         Broker {
             clients: HashMap::new(),
             subs: Vec::new(),
+            subs_exact: HashMap::new(),
+            subs_wild: Vec::new(),
             next_token: 1,
             drops: 0,
             dead_pruned: 0,
@@ -413,6 +421,38 @@ impl Broker {
         (token, stream)
     }
 
+    // A filter is wild if it contains '+' or '#'. Exact filters (no wildcards)
+    // are indexed in subs_exact so publish can look them up with a hash lookup.
+    fn is_wild_filter(filter: &str) -> bool {
+        filter.contains('+') || filter.contains('#')
+    }
+
+    // Add one subscription to `subs` (source of truth) and index it. Appends
+    // never renumber existing subs, so only the new entry needs indexing.
+    fn add_sub(&mut self, filter: String, token: usize, qos: u8) {
+        let idx = self.subs.len();
+        self.subs.push(Subscription { filter: filter.clone(), token, qos });
+        if Self::is_wild_filter(&filter) {
+            self.subs_wild.push(idx);
+        } else {
+            self.subs_exact.entry(filter).or_default().push(idx);
+        }
+    }
+
+    // Rebuild both tiers from scratch. Called after any mutation that shifts
+    // indices (UNSUBSCRIBE/remove_client retain, or publish swap_remove).
+    fn rebuild_index(&mut self) {
+        self.subs_exact.clear();
+        self.subs_wild.clear();
+        for (idx, s) in self.subs.iter().enumerate() {
+            if Self::is_wild_filter(&s.filter) {
+                self.subs_wild.push(idx);
+            } else {
+                self.subs_exact.entry(s.filter.clone()).or_default().push(idx);
+            }
+        }
+    }
+
     // forward to all matching subscribers; returns (delivered, dropped)
     // src_qos is the incoming PUBLISH QoS; per-subscriber forward QoS =
     // min(src_qos, sub.qos) per MQTT 3.1.1 §3.3.5. QoS1/2 forwards get a
@@ -428,19 +468,28 @@ impl Broker {
         }
         let mut delivered = 0usize;
         let mut dead: u64 = 0;
-        let mut i = 0;
-        while i < self.subs.len() {
-            if !topic_matches(&self.subs[i].filter, topic) {
-                i += 1;
-                continue;
+        // Candidate indices from the two-tier index: exact-match subscriptions
+        // come from the map with an O(1) hash lookup; only possibly-matching
+        // wildcard subscriptions still need topic_matches(). Each subscription
+        // is indexed in exactly one tier, so nothing is visited twice.
+        let mut idxs: Vec<usize> = Vec::new();
+        if let Some(exact) = self.subs_exact.get(topic) {
+            idxs.extend_from_slice(exact);
+        }
+        for &wi in &self.subs_wild {
+            if topic_matches(&self.subs[wi].filter, topic) {
+                idxs.push(wi);
             }
+        }
+        // Process in descending index order so swap_remove() (which pulls the
+        // last element into the removed slot) never invalidates a still-pending
+        // lower index. Delivery order may change; coverage does not.
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for i in idxs {
             let token = self.subs[i].token;
             let fwd_qos = src_qos.min(self.subs[i].qos);
             match self.deliver_to(token, topic, payload, fwd_qos, false) {
-                Ok(()) => {
-                    delivered += 1;
-                    i += 1;
-                }
+                Ok(()) => delivered += 1,
                 Err(()) => {
                     // client gone or too slow to accept reliable traffic:
                     // deliver_to already removed it; prune the subscription
@@ -450,6 +499,10 @@ impl Broker {
             }
         }
         self.dead_pruned += dead;
+        if dead > 0 {
+            // swap_remove renumbered subs, so the index must be rebuilt.
+            self.rebuild_index();
+        }
         // offline delivery for persistent sessions: QoS1/2 messages matching a
         // stored session's subscriptions are queued while the client is away
         // (QoS0 is at-most-once and never stored, per MQTT 3.1.1 §3.1.2.4)
@@ -558,6 +611,7 @@ impl Broker {
             println!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
         }
        self.subs.retain(|s| s.token != token);
+       self.rebuild_index();
        self.clients.remove(&token);
    }
 
@@ -706,8 +760,11 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     if clean_session {
                         broker.sessions.remove(&cid);
                     } else if let Some(sess) = broker.sessions.get(&cid) {
-                        for (filter, qos) in &sess.subs {
-                            broker.subs.push(Subscription { filter: filter.clone(), token, qos: *qos });
+                        let restore_subs: Vec<(String, u8)> = {
+                            sess.subs.iter().map(|(f, q)| (f.clone(), *q)).collect()
+                        };
+                        for (filter, qos) in restore_subs {
+                            broker.add_sub(filter.clone(), token, qos);
                             println!("[+] SESSION   {cid} restored sub {filter} (qos {qos})");
                         }
                     }
@@ -757,7 +814,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                 Some((pid, topics)) => {
                     let mut grants = Vec::new();
                     for (filter, qos) in &topics {
-                        broker.subs.push(Subscription { filter: filter.clone(), token, qos: *qos });
+                        broker.add_sub(filter.clone(), token, *qos);
                         grants.push(*qos);
                         println!("[+] SUBSCRIBE {} -> {filter} (qos {qos})", client_id);
                         // retained delivery: every stored message matching this
@@ -784,6 +841,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
             UNSUBSCRIBE => match parse_unsubscribe(&body) {
                 Some((pid, filters)) => {
                     broker.subs.retain(|s| !(s.token == token && filters.contains(&s.filter)));
+                    broker.rebuild_index();
                     for f in &filters {
                         println!("[-] UNSUBSCRIBE {} -> {f}", client_id);
                     }
