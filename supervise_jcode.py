@@ -17,7 +17,8 @@ BACKLOG = "/home/trade/mqtt_lab/jcode_backlog.json"
 CMDS = "/tmp"  # 生成的 cmd 文件目录
 
 def sh(cmd, timeout=60):
-    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
     return r.stdout.strip(), r.returncode
 
 def win(cmd, timeout=60):

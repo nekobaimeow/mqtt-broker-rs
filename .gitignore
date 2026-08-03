@@ -29,3 +29,5 @@ jcode_sys*.ps1
 list_procs.ps1
 patch_inspect*.ps1
 start_sys_task.ps1
+broker_state.bin
+mqtt_state*.bin

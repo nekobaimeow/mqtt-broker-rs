@@ -464,6 +464,11 @@ struct Broker {
     retained: HashMap<String, (Vec<u8>, u8)>, // topic -> (payload, qos)
     // persistent sessions (clean session = 0), keyed by client_id
     sessions: HashMap<String, SessionState>,
+    // dirty flag: set whenever retained or a persistent session changes; a
+    // save() flushes the whole state to disk and clears it.
+    dirty: bool,
+    // path of the broker_state.bin file (env MQTT_STATE_FILE or default)
+    state_file: String,
     // $SYS broker statistics (Mosquitto-style)
     sys_clients_total: u64,
     sys_msgs_received: u64,
@@ -480,6 +485,202 @@ struct SessionState {
     offline: VecDeque<(String, Vec<u8>, u8)>, // (topic, payload, qos) awaiting delivery
 }
 
+// ---- disk persistence (broker_state.bin) ----
+// Minimal hand-rolled binary format, no serde / external deps.
+//
+// Layout:
+//   magic     "MQTTSTATE\0"  (10 bytes)
+//   version   u8 = 1
+//   retained_count   u16
+//   retained entries: u16 topic_len, topic bytes, u16 payload_len, payload bytes, u8 qos
+//   session_count    u16
+//   sessions:
+//     u16 client_id_len, client_id bytes,
+//     u16 sub_count, (u16 filter_len, filter bytes, u8 qos)*,
+//     u16 offline_count, (u16 topic_len, topic, u16 payload_len, payload, u8 qos)*
+//
+// Reads tolerate truncation / corruption: any short buffer or bad count returns
+// Err, and the caller falls back to an empty in-memory state rather than panic.
+const STATE_MAGIC: &[u8] = b"MQTTSTATE\0";
+const STATE_VERSION: u8 = 1;
+
+// push a little-endian u16 helper
+fn push_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+// Serialize the current retained + sessions map into a byte buffer.
+fn serialize_state(
+    retained: &HashMap<String, (Vec<u8>, u8)>,
+    sessions: &HashMap<String, SessionState>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(STATE_MAGIC);
+    out.push(STATE_VERSION);
+    push_u16(&mut out, retained.len() as u16);
+    for (topic, (payload, qos)) in retained {
+        push_u16(&mut out, topic.len() as u16);
+        out.extend_from_slice(topic.as_bytes());
+        push_u16(&mut out, payload.len() as u16);
+        out.extend_from_slice(payload);
+        out.push(*qos);
+    }
+    push_u16(&mut out, sessions.len() as u16);
+    for (cid, sess) in sessions {
+        push_u16(&mut out, cid.len() as u16);
+        out.extend_from_slice(cid.as_bytes());
+        push_u16(&mut out, sess.subs.len() as u16);
+        for (filter, sqos) in &sess.subs {
+            push_u16(&mut out, filter.len() as u16);
+            out.extend_from_slice(filter.as_bytes());
+            out.push(*sqos);
+        }
+        push_u16(&mut out, sess.offline.len() as u16);
+        for (topic, payload, oqos) in &sess.offline {
+            push_u16(&mut out, topic.len() as u16);
+            out.extend_from_slice(topic.as_bytes());
+            push_u16(&mut out, payload.len() as u16);
+            out.extend_from_slice(payload);
+            out.push(*oqos);
+        }
+    }
+    out
+}
+
+// Take exactly n bytes, else None (short read).
+fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
+    if *pos + n > buf.len() {
+        return None;
+    }
+    let s = &buf[*pos..*pos + n];
+    *pos += n;
+    Some(s)
+}
+
+// Take a little-endian u16, else None on truncation.
+fn take_u16(buf: &[u8], pos: &mut usize) -> Option<u16> {
+    let b = take(buf, pos, 2)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+// Deserialize the previous serialize_state() output. Any truncation, bad magic,
+// bad version, or out-of-bounds read yields None (caller starts empty).
+fn deserialize_state(
+    data: &[u8],
+) -> Option<(HashMap<String, (Vec<u8>, u8)>, HashMap<String, SessionState>)> {
+    // Validate magic + version.
+    if data.len() < STATE_MAGIC.len() + 1 {
+        return None;
+    }
+    if &data[..STATE_MAGIC.len()] != STATE_MAGIC {
+        return None;
+    }
+    if data[STATE_MAGIC.len()] != STATE_VERSION {
+        return None;
+    }
+    let mut pos = STATE_MAGIC.len() + 1;
+    let rcount = take_u16(data, &mut pos)? as usize;
+    let mut retained = HashMap::new();
+    for _ in 0..rcount {
+        let tlen = take_u16(data, &mut pos)? as usize;
+        let topic = take(data, &mut pos, tlen)?;
+        let plen = take_u16(data, &mut pos)? as usize;
+        let payload = take(data, &mut pos, plen)?;
+        let qos = take(data, &mut pos, 1)?[0];
+        // Reject impossible QoS so a corrupt byte can't poison routing.
+        if qos > 2 {
+            return None;
+        }
+        retained.insert(
+            String::from_utf8_lossy(topic).to_string(),
+            (payload.to_vec(), qos),
+        );
+    }
+    let scount = take_u16(data, &mut pos)? as usize;
+    let mut sessions = HashMap::new();
+    for _ in 0..scount {
+        let clen = take_u16(data, &mut pos)? as usize;
+        let cid = take(data, &mut pos, clen)?;
+        let s_count = take_u16(data, &mut pos)? as usize;
+        let mut subs = Vec::new();
+        for _ in 0..s_count {
+            let flen = take_u16(data, &mut pos)? as usize;
+            let filter = take(data, &mut pos, flen)?;
+            let sqos = take(data, &mut pos, 1)?[0];
+            if sqos > 2 {
+                return None;
+            }
+            subs.push((String::from_utf8_lossy(filter).to_string(), sqos));
+        }
+        let o_count = take_u16(data, &mut pos)? as usize;
+        let mut offline = VecDeque::new();
+        for _ in 0..o_count {
+            let tlen = take_u16(data, &mut pos)? as usize;
+            let topic = take(data, &mut pos, tlen)?;
+            let plen = take_u16(data, &mut pos)? as usize;
+            let payload = take(data, &mut pos, plen)?;
+            let oqos = take(data, &mut pos, 1)?[0];
+            if oqos > 2 {
+                return None;
+            }
+            offline.push_back((
+                String::from_utf8_lossy(topic).to_string(),
+                payload.to_vec(),
+                oqos,
+            ));
+        }
+        sessions.insert(
+            String::from_utf8_lossy(cid).to_string(),
+            SessionState { subs, offline },
+        );
+    }
+    Some((retained, sessions))
+}
+
+impl Broker {
+    // Write the retained table + persistent sessions to the state file.
+    // Best-effort: errors are printed but never fatal (broker keeps running).
+    fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let data = serialize_state(&self.retained, &self.sessions);
+        match std::fs::write(&self.state_file, data) {
+            Ok(()) => {
+                self.dirty = false;
+                println!("[=] STATE     saved {} retained, {} sessions", self.retained.len(), self.sessions.len());
+            }
+            Err(e) => println!("[!] STATE     save failed: {e}"),
+        }
+    }
+
+    // Load persisted state from disk into memory at startup. Returns the number
+    // of sessions restored (used for a log line); tolerance of truncation is
+    // handled here by falling back to empty state rather than panicking.
+    fn load_state(&mut self) {
+        match std::fs::read(&self.state_file) {
+            Ok(data) => match deserialize_state(&data) {
+                Some((retained, sessions)) => {
+                    let sessions_len = sessions.len();
+                    self.retained = retained;
+                    self.sessions = sessions;
+                    println!("[=] STATE     loaded {} retained, {} sessions from {}", self.retained.len(), sessions_len, self.state_file);
+                }
+                None => {
+                    println!("[!] STATE     {} is corrupt/truncated; starting with empty state", self.state_file);
+                }
+            },
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("[=] STATE     no {} found; starting fresh", self.state_file);
+            }
+            Err(e) => {
+                println!("[!] STATE     could not read {}: {e}; starting empty", self.state_file);
+            }
+        }
+        self.dirty = true; // ensure a fresh current snapshot is written on first save
+    }
+}
+
 impl Broker {
     fn new() -> Self {
         let now = Instant::now();
@@ -493,6 +694,9 @@ impl Broker {
             dead_pruned: 0,
             retained: HashMap::new(),
             sessions: HashMap::new(),
+            dirty: false,
+            state_file: std::env::var("MQTT_STATE_FILE")
+                .unwrap_or_else(|_| "broker_state.bin".into()),
             sys_clients_total: 0,
             sys_msgs_received: 0,
             sys_msgs_sent: 0,
@@ -552,8 +756,10 @@ impl Broker {
         if retain {
             if payload.is_empty() {
                 self.retained.remove(topic);
+                self.dirty = true;
             } else {
                 self.retained.insert(topic.to_string(), (payload.to_vec(), src_qos));
+                self.dirty = true;
             }
         }
         let mut delivered = 0usize;
@@ -617,6 +823,7 @@ impl Broker {
                 if let Some(sess) = self.sessions.get_mut(&cid) {
                     if sess.offline.len() < OFFLINE_CAP {
                         sess.offline.push_back((topic.to_string(), payload.to_vec(), src_qos.min(sqos)));
+                        self.dirty = true;
                     }
                 }
             }
@@ -706,10 +913,12 @@ impl Broker {
                 }
             }
             println!("[=] SESSION   {cid} persisted ({} subs, {} queued)", entry.subs.len(), entry.offline.len());
+            self.dirty = true;
         }
        self.subs.retain(|s| s.token != token);
        self.rebuild_index();
        self.clients.remove(&token);
+        self.save();
    }
 
     // Publish $SYS broker topics as retained messages every 10s.
@@ -855,7 +1064,9 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     // into the new client (offline queue is flushed below, after
                     // the subscription restore so forwards find the new token).
                     if clean_session {
-                        broker.sessions.remove(&cid);
+                        if broker.sessions.remove(&cid).is_some() {
+                            broker.dirty = true;
+                        }
                     } else if let Some(sess) = broker.sessions.get(&cid) {
                         let restore_subs: Vec<(String, u8)> = {
                             sess.subs.iter().map(|(f, q)| (f.clone(), *q)).collect()
@@ -900,7 +1111,9 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                                 }
                             }
                         }
-                        broker.sessions.remove(&cid); // delivered, session now lives on the socket
+                        if broker.sessions.remove(&cid).is_some() {
+                            broker.dirty = true; // flushed queue, session moved to socket
+                        }
                     }
                     println!("[+] CONNECT  {cid}  (token {token}, clean={clean_session})");
                     broker.sys_clients_total += 1;
@@ -1058,6 +1271,8 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
     }
    let _ = keepalive;
     broker.sys_msgs_received += pkt_count as u64;
+    // persist retained + session changes made by this batch of packets
+    broker.save();
    Ok(())
 }
 
@@ -1156,6 +1371,7 @@ fn main() {
         .register(&mut listener, LISTENER, Interest::READABLE)
         .expect("register listener");
     let mut broker = Broker::new();
+    broker.load_state();
     println!("[mqtt-mio-broker] listening on {addr} (mio {})", env!("CARGO_PKG_VERSION"));
 
     let mut idle_rounds: u32 = 0;
