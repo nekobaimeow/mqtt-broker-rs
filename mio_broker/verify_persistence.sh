@@ -26,9 +26,9 @@ def pkt(b):
 c = pkt(b'\x10\x0e\x00\x04MQTT\x04\x00\x00\x3c\x00\x02c1')
 s = c.recv(4); assert s[0] == 0x20, f"no CONNACK: {s!r}"
 # SUBSCRIBE a/b QoS1 (pid=1)
-c.sendall(b'\x82\x0b\x00\x01\x00\x03a/b\x01'); time.sleep(0.3); c.recv(100)
+c.sendall(b'\x82\x08\x00\x01\x00\x03a/b\x01'); time.sleep(0.3); c.recv(100)
 # PUBLISH retain a/b "hi"
-c.sendall(b'\x30\x0b\x00\x03a/bhi'); time.sleep(0.3)
+c.sendall(b'\x31\x07\x00\x03a/bhi'); time.sleep(0.3)
 c.close()
 print("  retain a/b + session c1 set up (clean=0)")
 EOF
@@ -51,8 +51,9 @@ addr = sys.argv[1]; host, port = addr.split(':'); port = int(port)
 s = socket.create_connection((host, port))
 s.sendall(b'\x10\x0e\x00\x04MQTT\x04\x02\x00\x3c\x00\x02x1')
 s.recv(4)
-s.sendall(b'\x82\x0b\x00\x01\x00\x03a/b\x00')
+s.sendall(b'\x82\x08\x00\x01\x00\x03a/b\x00')
 time.sleep(0.5)
+s.settimeout(1)
 data = b''
 try:
     while True:
@@ -60,8 +61,9 @@ try:
         if not chunk: break
         data += chunk
         if len(data) > 300: break
-except: pass
-assert b'\x30' in data and b'a/b' in data and b'hi' in data, f"retained NOT delivered: {data!r}"
+except socket.timeout:
+    pass
+assert b'\x31' in data and b'a/b' in data and b'hi' in data, f"retained NOT delivered: {data!r}"
 print("  retained delivered after restart OK")
 EOF
 

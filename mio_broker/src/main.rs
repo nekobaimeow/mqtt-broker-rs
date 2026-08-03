@@ -315,6 +315,9 @@ struct Client {
     keepalive_deadline: Option<Instant>,
     keepalive_secs: u16,
     token: usize,
+    // last interest registered with the poll registry; reregister is an
+    // epoll_ctl syscall, so skip it when the desired interest is unchanged
+    interest: Interest,
     next_pid: u16,                     // QoS1/2 packet-id allocator (1..=65535)
     in_flight: HashMap<u16, InFlight>, // pid -> outbound ack state
     received_qos2: HashMap<u16, ()>,   // inbound QoS2 pids seen (dedup until PUBREL)
@@ -480,6 +483,8 @@ struct Broker {
     // dirty flag: set whenever retained or a persistent session changes; a
     // save() flushes the whole state to disk and clears it.
     dirty: bool,
+    // last time save() actually wrote (throttles disk writes off the hot path)
+    last_save: Instant,
     // path of the broker_state.bin file (env MQTT_STATE_FILE or default)
     state_file: String,
     // $SYS broker statistics (Mosquitto-style)
@@ -661,6 +666,7 @@ impl Broker {
         match std::fs::write(&self.state_file, data) {
             Ok(()) => {
                 self.dirty = false;
+                self.last_save = Instant::now();
                 println!("[=] STATE     saved {} retained, {} sessions", self.retained.len(), self.sessions.len());
             }
             Err(e) => println!("[!] STATE     save failed: {e}"),
@@ -708,6 +714,7 @@ impl Broker {
             retained: HashMap::new(),
             sessions: HashMap::new(),
             dirty: false,
+            last_save: now,
             state_file: std::env::var("MQTT_STATE_FILE")
                 .unwrap_or_else(|_| "broker_state.bin".into()),
             sys_clients_total: 0,
@@ -1353,9 +1360,11 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
         }
     }
     broker.sys_msgs_received += pkt_count as u64;
-    // persist retained + session changes made by this batch of packets
-    broker.save();
-   Ok(())
+    // NOTE: no save() here — disk writes on the per-batch hot path cause
+    // latency spikes (a dirty $SYS retain makes every following PUBLISH batch
+    // serialize + fsync synchronously). save() is now called from the main
+    // loop tail with a 200ms throttle, keeping the receive path pure-memory.
+    Ok(())
 }
 
 fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
@@ -1412,7 +1421,11 @@ fn flush_writes(registry: &Registry, broker: &mut Broker, token: usize) {
         } else {
             Interest::READABLE | Interest::WRITABLE
         };
-        let _ = registry.reregister(&mut c.stream, Token(token), interest);
+        // skip the epoll_ctl syscall when the interest didn't actually change
+        if c.interest != interest {
+            let _ = registry.reregister(&mut c.stream, Token(token), interest);
+            c.interest = interest;
+        }
     }
 }
 
@@ -1503,6 +1516,7 @@ fn main() {
                                     keepalive_deadline: None,
                                     keepalive_secs: 0,
                                     token,
+                                    interest: Interest::READABLE,
                                     next_pid: 1,
                                     in_flight: HashMap::new(),
                                     received_qos2: HashMap::new(),
@@ -1545,11 +1559,14 @@ fn main() {
                             flush_writes(poll.registry(), &mut broker, token);
                         } else {
                             if let Some(c) = broker.clients.get_mut(&token) {
-                                let _ = poll.registry().reregister(
-                                    &mut c.stream,
-                                    Token(token),
-                                    Interest::READABLE,
-                                );
+                                if c.interest != Interest::READABLE {
+                                    let _ = poll.registry().reregister(
+                                        &mut c.stream,
+                                        Token(token),
+                                        Interest::READABLE,
+                                    );
+                                    c.interest = Interest::READABLE;
+                                }
                             }
                         }
                     }
@@ -1658,6 +1675,11 @@ fn main() {
                 println!("[!] GIVEUP   {} pid {pid} after {QOS1_MAX_RETRIES} retries", c.client_id);
                 broker.remove_client(t);
             }
+        }
+        // throttled state flush: persist dirty retained/session changes at most
+        // every 200ms, off the packet hot path (see handle_packets note).
+        if broker.dirty && broker.last_save.elapsed() >= Duration::from_millis(200) {
+            broker.save();
         }
         let loop_ms = loop_start.elapsed().as_micros();
         if loop_ms > 1000 {
