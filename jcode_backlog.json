@@ -13,38 +13,40 @@
     "id": "disk-persistence",
     "desc": "消息持久化：retain + 持久会话离线队列落盘，重启不丢",
     "status": "done",
-    "commit": "",
+    "commit": "e0cbd1e",
     "started_at": "2026-08-03 19:18:58",
-    "finished_at": "2026-08-03 19:28:04",
-    "note": "head b2bd67c chore: purge jcode temp scripts, ignore pipeline artifacts -> dd938e7 Persist retained messages and persistent sessions to disk + build OK",
+    "finished_at": "2026-08-03 19:40",
+    "note": "verified: 45/45 regression + kill-9 restart recovery test PASSED (retain survives)",
     "started_head": "b2bd67c chore: purge jcode temp scripts, ignore pipeline artifacts"
   },
   {
     "id": "shared-subs",
     "desc": "共享订阅 $share/g: 同组客户端轮询分发（MQTT 3.1.1 常见扩展）",
-    "status": "in_progress",
+    "status": "cancelled",
     "commit": "",
     "started_at": "2026-08-03 19:28:04",
-    "finished_at": "",
-    "note": "",
+    "finished_at": "2026-08-03 19:59:28",
+    "note": "pipeline halted by user at 19:45",
     "started_head": "dd938e7 Persist retained messages and persistent sessions to disk"
   },
   {
     "id": "sys-more",
     "desc": "$SYS 扩展：bytes sent/received、heap、subscriptions 细分、clients maximum",
-    "status": "pending",
+    "status": "cancelled",
     "commit": "",
-    "started_at": "",
-    "finished_at": "",
-    "note": ""
+    "started_at": "2026-08-03 19:59:28",
+    "finished_at": "2026-08-03 20:31:00",
+    "note": "pipeline halted by user at 19:45",
+    "started_head": "81cda7a Add MQTT shared subscriptions (\\$share/) with per-group round-robin delivery"
   },
   {
     "id": "conn-rate-limit",
     "desc": "连接限流：每 IP 并发上限 + 全局连接速率限制（防滥用）",
-    "status": "pending",
+    "status": "cancelled",
     "commit": "",
-    "started_at": "",
+    "started_at": "2026-08-03 20:31:00",
     "finished_at": "",
-    "note": ""
+    "note": "pipeline halted by user at 19:45",
+    "started_head": "81cda7a Add MQTT shared subscriptions (\\$share/) with per-group round-robin delivery"
   }
 ]
