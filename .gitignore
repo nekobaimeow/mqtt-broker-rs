@@ -18,3 +18,14 @@ qos2_test
 # python caches
 __pycache__/
 *.pyc
+
+# jcode pipeline temp scripts
+*.cmd
+apply-patch-and-bash-windows/
+analyze_*.ps1
+check_*.ps1
+cleanup*.ps1
+jcode_sys*.ps1
+list_procs.ps1
+patch_inspect*.ps1
+start_sys_task.ps1
