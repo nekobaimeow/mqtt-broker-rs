@@ -301,6 +301,7 @@ struct Client {
     write_off: usize,       // consumed bytes of write_pending
     client_id: String,
     keepalive_deadline: Option<Instant>,
+    keepalive_secs: u16,
     token: usize,
     next_pid: u16,                     // QoS1/2 packet-id allocator (1..=65535)
     in_flight: HashMap<u16, InFlight>, // pid -> outbound ack state
@@ -1055,6 +1056,17 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
    };
    let pkt_count = pkts.len();
 
+   // MQTT-3.1.2-23: broker must treat ANY packet as liveness proof. Refresh the
+   // keepalive deadline on every received packet so bursty publishers that skip
+   // PINGREQ (paho clients send PINGREQ only when idle) aren't dropped mid-load.
+   {
+       let c = broker.clients.get_mut(&token).unwrap();
+       if let Some(_) = c.keepalive_deadline {
+           let ka = c.keepalive_secs;
+           c.keepalive_deadline = Some(Instant::now() + Duration::from_secs((ka as f64 * 1.5) as u64));
+       }
+   }
+
    for (ptype, flags, body) in pkts {
        match ptype {
             CONNECT => match parse_connect(&body) {
@@ -1084,6 +1096,7 @@ fn handle_packets(broker: &mut Broker, token: usize) -> Result<(), String> {
                     } else {
                         None
                     };
+                    c.keepalive_secs = ka;
                     c.will_flag = will_flag;
                     c.will_qos = will_qos;
                     c.will_retain = will_retain;
@@ -1409,6 +1422,7 @@ fn main() {
                                     write_off: 0,
                                     client_id: String::new(),
                                     keepalive_deadline: None,
+                                    keepalive_secs: 0,
                                     token,
                                     next_pid: 1,
                                     in_flight: HashMap::new(),
